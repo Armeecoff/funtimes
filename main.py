@@ -10,6 +10,7 @@ from db import init_db
 import admin as h_admin
 import menu as h_menu
 import start as h_start
+from op_guard import StartOpGuardMiddleware
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
@@ -18,6 +19,9 @@ async def main():
     await init_db()
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
+    start_op_guard = StartOpGuardMiddleware()
+    dp.message.middleware(start_op_guard)
+    dp.callback_query.middleware(start_op_guard)
     # admin first so admin's reply-button labels match before user handlers
     dp.include_router(h_admin.router)
     dp.include_router(h_start.router)
