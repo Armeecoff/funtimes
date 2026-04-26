@@ -2,7 +2,7 @@ import asyncio
 import html
 import re
 from aiogram import Bot
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramBadRequest
 
 from db import fetchall, fetchone, get_setting
@@ -50,6 +50,24 @@ def build_subscription_gate_text(channels: list[tuple[str, str]], target_name: s
         f"{channel_lines}</blockquote>\n\n"
         "📷 После подписки нажми «Проверить доступ»."
     )
+
+
+def build_subscription_gate_kb(
+    channels: list[tuple[str, str]],
+    category: str,
+    *,
+    back_to_menu: bool = False,
+) -> InlineKeyboardMarkup:
+    rows = []
+    for link, title in channels:
+        if link:
+            rows.append([InlineKeyboardButton(text=title, url=link)])
+        else:
+            rows.append([InlineKeyboardButton(text=title, callback_data=f"op_check:{category}")])
+    rows.append([InlineKeyboardButton(text="Проверить доступ", callback_data=f"op_check:{category}")])
+    if back_to_menu:
+        rows.append([InlineKeyboardButton(text="Назад", callback_data="nav:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def format_shop_item_block(
