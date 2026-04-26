@@ -12,7 +12,12 @@ from aiogram.fsm.context import FSMContext
 from db import get_or_create_user, get_setting, set_setting, fetchone, execute, is_admin
 from states import CaptchaSG
 from keyboards import main_menu_kb, remove_reply
-from utils import send_section, check_user_subscriptions, build_subscription_gate_text
+from utils import (
+    send_section,
+    check_user_subscriptions,
+    build_subscription_gate_text,
+    build_subscription_gate_kb,
+)
 
 router = Router()
 
@@ -21,12 +26,6 @@ def captcha_kb(options: list[int], correct: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=str(o), callback_data=f"captcha:{o}:{correct}")] for o in options
     ])
-
-
-def op_kb(channels: list[tuple[str, str]], category: str) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text=title, url=link)] for link, title in channels]
-    rows.append([InlineKeyboardButton(text="Проверить доступ", callback_data=f"op_check:{category}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def show_main_menu(target, state: FSMContext):
@@ -44,7 +43,7 @@ async def gate_and_show_menu(message_or_call, user_id: int, state: FSMContext, b
         not_subbed = await check_user_subscriptions(bot, user_id, "start")
         if not_subbed:
             text = build_subscription_gate_text(not_subbed, "бота")
-            kb = op_kb(not_subbed, "start")
+            kb = build_subscription_gate_kb(not_subbed, "start")
             await send_section(message_or_call, text, "op_photo", reply_markup=kb)
             return False
 
