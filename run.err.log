@@ -1,0 +1,3 @@
+2026-04-24 14:53:21,578 [INFO] root: Bot started: @token1_12bot (id=8364896465)
+2026-04-24 14:53:21,710 [INFO] aiogram.dispatcher: Start polling
+2026-04-24 14:53:21,712 [INFO] aiogram.dispatcher: Run polling for bot @token1_12bot id=8364896465 - 'TestBot'
