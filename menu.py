@@ -21,6 +21,7 @@ from utils import (
     format_shop_item_block,
     apply_stored_icon_to_button_text,
     build_subscription_gate_text,
+    build_subscription_gate_kb,
 )
 
 router = Router()
@@ -295,14 +296,11 @@ async def show_tasks(call: CallbackQuery, bot: Bot):
     if (await get_setting("tasks_op_enabled", "0")) == "1":
         not_subbed = await check_user_subscriptions(bot, call.from_user.id, "tasks")
         if not_subbed:
-            rows = [[InlineKeyboardButton(text=title, url=link)] for link, title in not_subbed]
-            rows.append([InlineKeyboardButton(text="Проверить доступ", callback_data="op_check:tasks")])
-            rows.append([InlineKeyboardButton(text="Назад", callback_data="nav:menu")])
             await send_section(
                 call,
                 build_subscription_gate_text(not_subbed, "задания"),
                 "op_photo",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+                reply_markup=build_subscription_gate_kb(not_subbed, "tasks", back_to_menu=True),
             )
             return
 
