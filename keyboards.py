@@ -1,5 +1,11 @@
+import re
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 from db import get_setting
+
+_LEADING_EMOJI_RE = re.compile(
+    r'^[\u2300-\u27BF\u2B00-\u2BFF\U0001F000-\U0010FFFF]'
+    r'[\uFE0F\u20E3\u200D\U0001F3FB-\U0001F3FF]*\s*'
+)
 
 
 def remove_reply():
@@ -9,6 +15,7 @@ def remove_reply():
 VALID_STYLES = ("default", "primary", "success", "danger")
 VALID_SIZES = ("default", "full")
 CHANNEL_LINK_STYLE_KEY = "op_channel_link"
+OP_CHECK_STYLE_KEY = "op_check_gate"
 
 
 def _is_telegram_link(url: str | None) -> bool:
@@ -36,23 +43,35 @@ async def apply_button_settings(button: InlineKeyboardButton) -> tuple[InlineKey
     style, icon, size = await _button_setting_triplet(key)
     if button.url and _is_telegram_link(button.url) and not style and not icon and size in ("", "default"):
         style, icon, size = await _button_setting_triplet(CHANNEL_LINK_STYLE_KEY)
+    if (
+        button.callback_data
+        and button.callback_data.startswith("op_check:")
+        and not style
+        and not icon
+        and size in ("", "default")
+    ):
+        style, icon, size = await _button_setting_triplet(OP_CHECK_STYLE_KEY)
     if size not in VALID_SIZES:
         size = "default"
 
-    updates = {"style": None, "icon_custom_emoji_id": None}
+    updates = {}
     if style in VALID_STYLES and style != "default":
         updates["style"] = style
 
     if icon:
+        clean_text = _LEADING_EMOJI_RE.sub('', button.text) or button.text
         if icon.startswith("tx:"):
             prefix = icon[3:].strip()
-            if prefix and not button.text.startswith(f"{prefix} "):
-                updates["text"] = f"{prefix} {button.text}"
+            if prefix:
+                updates["text"] = f"{prefix} {clean_text}"
         else:
             cid = icon[3:] if icon.startswith("id:") else icon
             if cid:
                 updates["icon_custom_emoji_id"] = cid
+                updates["text"] = clean_text
 
+    if not updates:
+        return button, size
     return button.model_copy(update=updates), size
 
 
@@ -123,6 +142,7 @@ async def main_menu_kb(is_admin: bool = False) -> InlineKeyboardMarkup:
         await mk_btn("Профиль", callback_data="nav:profile"),
         await mk_btn("Задания", callback_data="nav:tasks"),
         await mk_btn("Заработок с ферм  ", callback_data="nav:earn"),
+        await mk_btn("Магазин ресурсов", callback_data="nav:token_shop"),
         await mk_btn("Казино", callback_data="nav:casino"),
         await mk_btn("Фантайм", callback_data="nav:funtime"),
         await mk_btn("Кража", callback_data="nav:theft"),
@@ -157,12 +177,8 @@ async def profile_kb() -> InlineKeyboardMarkup:
     return await auto_kb([
         await mk_btn("Бонус", callback_data="nav:bonus"),
         await mk_btn("Вывести", callback_data="nav:withdraw"),
+        await mk_btn("Информация", callback_data="nav:info"),
         await mk_btn("Назад", callback_data="nav:menu"),
-    ])
-    return await kb([
-        [await mk_btn("Бонус", callback_data="nav:bonus"),
-         await mk_btn("Вывести", callback_data="nav:withdraw")],
-        [await mk_btn("Назад", callback_data="nav:menu")],
     ])
 
 
@@ -260,6 +276,8 @@ async def admin_kb() -> InlineKeyboardMarkup:
         await mk_btn("Пользователи", callback_data="adm:users"),
         await mk_btn("Статистика", callback_data="adm:stats"),
         await mk_btn("Рассылка", callback_data="adm:broadcast"),
+        await mk_btn("Авто-рассылка", callback_data="adm:auto_broadcast"),
+        await mk_btn("Авто-обновление заданий", callback_data="adm:task_reset"),
         await mk_btn("Экономика", callback_data="adm:econ"),
         await mk_btn("Каналы", callback_data="adm:channels"),
         await mk_btn("Промокоды", callback_data="adm:promo"),
@@ -271,17 +289,22 @@ async def admin_kb() -> InlineKeyboardMarkup:
         await mk_btn("Админы", callback_data="adm:admins"),
         await mk_btn("Задания", callback_data="adm:tasks"),
         await mk_btn("Магазин", callback_data="adm:shop"),
+        await mk_btn("Магазин ресурсов", callback_data="adm:token_shop"),
         await mk_btn("Фантайм IP", callback_data="adm:funtime"),
+        await mk_btn("Тех перерыв", callback_data="adm:maintenance"),
         await mk_btn("Правила", callback_data="adm:rules"),
         await mk_btn("Фото разделов", callback_data="adm:photos"),
         await mk_btn("Тексты", callback_data="adm:texts"),
         await mk_btn("Стиль кнопок", callback_data="adm:styles"),
+        await mk_btn("🕐 Время сервера", callback_data="adm:server_time"),
         await mk_btn("В меню пользователя", callback_data="nav:menu"),
     ])
     return await kb([
         [await mk_btn("Пользователи", callback_data="adm:users"),
          await mk_btn("Статистика", callback_data="adm:stats")],
         [await mk_btn("Рассылка", callback_data="adm:broadcast"),
+         await mk_btn("Авто-рассылка", callback_data="adm:auto_broadcast")],
+        [await mk_btn("Авто-обновление заданий", callback_data="adm:task_reset"),
          await mk_btn("Экономика", callback_data="adm:econ")],
         [await mk_btn("Каналы", callback_data="adm:channels"),
          await mk_btn("Промокоды", callback_data="adm:promo")],
