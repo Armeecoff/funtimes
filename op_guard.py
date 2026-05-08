@@ -3,7 +3,7 @@ from typing import Any, Awaitable, Callable
 from aiogram import BaseMiddleware, Bot
 from aiogram.types import CallbackQuery, Message, TelegramObject
 
-from db import get_setting, is_admin
+from db import get_setting, is_admin, fetchone, increment_user_daily_action
 from utils import (
     build_subscription_gate_kb,
     build_subscription_gate_text,
@@ -19,15 +19,25 @@ class StartOpGuardMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: dict[str, Any],
     ) -> Any:
-        if await self._is_allowed_without_start_op(event):
-            return await handler(event, data)
-
         bot = data.get("bot")
         user = getattr(event, "from_user", None)
         if not isinstance(bot, Bot) or user is None:
             return await handler(event, data)
 
+        banned = await fetchone("SELECT banned FROM users WHERE user_id=?", (user.id,))
+        if banned and banned[0]:
+            return None
+
+        if (await get_setting("maintenance_enabled", "0")) == "1" and not await is_admin(user.id):
+            await self._show_maintenance(event)
+            return None
+
+        if await self._is_allowed_without_start_op(event):
+            return await handler(event, data)
+
         if (await get_setting("start_op_enabled", "0")) != "1":
+            if not await is_admin(user.id):
+                await increment_user_daily_action(user.id)
             return await handler(event, data)
 
         if await self._is_admin_event(event, data):
@@ -35,6 +45,7 @@ class StartOpGuardMiddleware(BaseMiddleware):
 
         not_subbed = await check_user_subscriptions(bot, user.id, "start")
         if not not_subbed:
+            await increment_user_daily_action(user.id)
             return await handler(event, data)
 
         await self._show_start_op_gate(event, not_subbed)
@@ -90,12 +101,24 @@ class StartOpGuardMiddleware(BaseMiddleware):
                 "task_kind:",
                 "task_channel:",
                 "shop_",
+                "tsadm:",
                 "ft_",
+                "maint:",
                 "photo_set:",
                 "text_set:",
                 "style_",
                 "size_",
                 "icon_",
+                "abr:",
+                "treset:",
+                "task_toggle_reset:",
+                "adm:daily_threshold",
+                "ch_del_yes:",
+                "shop_del_yes:",
+                "tsadm:cat_del_yes:",
+                "tsadm:item_del_yes:",
+                "ft_del_yes:",
+                "adm_fire_yes:",
             )
             return value in admin_exact or value.startswith(admin_prefixes)
 
@@ -120,3 +143,20 @@ class StartOpGuardMiddleware(BaseMiddleware):
 
         if isinstance(event, Message):
             await send_section(event, text, "op_photo", reply_markup=markup)
+
+    async def _show_maintenance(self, event: TelegramObject) -> None:
+        text = (await get_setting("maintenance_text", "")).strip()
+        if not text:
+            text = "<b>Технический перерыв</b>\n\nБот временно недоступен. Попробуйте позже."
+
+        if isinstance(event, CallbackQuery):
+            try:
+                await event.answer("Технический перерыв", show_alert=True)
+            except Exception:
+                pass
+            if event.message:
+                await send_section(event, text, "maintenance_photo")
+            return
+
+        if isinstance(event, Message):
+            await send_section(event, text, "maintenance_photo")
