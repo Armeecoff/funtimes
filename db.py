@@ -1,11 +1,20 @@
 import aiosqlite
 import time
+from datetime import datetime, timedelta
+from msk_time import now_msk
 from typing import Any, Optional
 from config import DB_PATH, DEFAULTS, OWNER_ID
 
 FUNTIME_TEST_DEFAULTS = (
     ("test4", "test4.funtime.sh"),
     ("test-neo", "test-neo.funtime.sh"),
+)
+
+TOKEN_SHOP_DEFAULT_CATEGORIES = (
+    ("Ресурсы", "<b>Ресурсы</b>\n\nВыберите товар из категории ниже.", 10),
+    ("Редкое", "<b>Редкое</b>\n\nЗдесь собраны более редкие товары.", 20),
+    ("Донат", "<b>Донат</b>\n\nВыберите донат-товар для покупки.", 30),
+    ("Наборы", "<b>Наборы</b>\n\nГотовые наборы доступны ниже.", 40),
 )
 
 SCHEMA = """
@@ -20,12 +29,16 @@ CREATE TABLE IF NOT EXISTS users (
     balance INTEGER DEFAULT 0,
     referrals INTEGER DEFAULT 0,
     referrer_id INTEGER,
+    referral_rewarded INTEGER DEFAULT 0,
     captcha_passed INTEGER DEFAULT 0,
     last_bonus INTEGER DEFAULT 0,
+    last_theft INTEGER DEFAULT 0,
+    last_subscription_check INTEGER DEFAULT 0,
     minecraft_nick TEXT,
     banned INTEGER DEFAULT 0,
     protected INTEGER DEFAULT 0,
-    created_at INTEGER
+    created_at INTEGER,
+    daily_actions INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS admins (
     user_id INTEGER PRIMARY KEY,
@@ -50,6 +63,7 @@ CREATE TABLE IF NOT EXISTS channel_join_log (
     channel_id INTEGER,
     user_id INTEGER,
     invite_link TEXT,
+    event_type TEXT DEFAULT 'request',
     created_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS tasks (
@@ -60,7 +74,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     completions INTEGER DEFAULT 0,
     active INTEGER DEFAULT 1,
     task_type TEXT DEFAULT 'manual',
-    channel_id INTEGER
+    channel_id INTEGER,
+    check_text TEXT DEFAULT '',
+    check_scope TEXT DEFAULT 'name',
+    reset_period TEXT DEFAULT 'once',
+    last_reset_date TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS task_completions (
     user_id INTEGER,
@@ -93,6 +111,70 @@ CREATE TABLE IF NOT EXISTS user_farms (
     item_id INTEGER,
     bought_at INTEGER,
     last_collected INTEGER
+);
+CREATE TABLE IF NOT EXISTS token_shop_categories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT,
+    menu_text TEXT DEFAULT '',
+    emoji_icon TEXT DEFAULT '',
+    active INTEGER DEFAULT 1,
+    sort_order INTEGER DEFAULT 0,
+    created_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS token_shop_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    category_id INTEGER,
+    name TEXT,
+    description TEXT DEFAULT '',
+    price INTEGER DEFAULT 0,
+    emoji_icon TEXT DEFAULT '',
+    active INTEGER DEFAULT 1,
+    sort_order INTEGER DEFAULT 0,
+    created_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS token_shop_inventory (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    item_id INTEGER,
+    category_id INTEGER,
+    item_name TEXT,
+    category_name TEXT,
+    price INTEGER DEFAULT 0,
+    emoji_icon TEXT DEFAULT '',
+    status TEXT DEFAULT 'available',
+    bought_at INTEGER,
+    updated_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS token_shop_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    inventory_id INTEGER,
+    user_id INTEGER,
+    item_id INTEGER,
+    category_id INTEGER,
+    item_name TEXT,
+    category_name TEXT,
+    price INTEGER DEFAULT 0,
+    anarchy_number TEXT DEFAULT '',
+    minecraft_nick TEXT DEFAULT '',
+    status TEXT DEFAULT 'pending',
+    created_at INTEGER,
+    processed_at INTEGER,
+    processed_by INTEGER
+);
+CREATE TABLE IF NOT EXISTS token_shop_purchases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    item_id INTEGER,
+    category_id INTEGER,
+    item_name TEXT,
+    category_name TEXT,
+    price INTEGER DEFAULT 0,
+    anarchy_number TEXT DEFAULT '',
+    minecraft_nick TEXT DEFAULT '',
+    status TEXT DEFAULT 'inventory',
+    bought_at INTEGER,
+    processed_at INTEGER,
+    processed_by INTEGER
 );
 CREATE TABLE IF NOT EXISTS promocodes (
     code TEXT PRIMARY KEY,
@@ -139,6 +221,17 @@ CREATE TABLE IF NOT EXISTS channel_stats (
     members INTEGER DEFAULT 0,
     reach INTEGER DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS token_shop_cart (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    item_id INTEGER NOT NULL,
+    category_id INTEGER NOT NULL,
+    item_name TEXT NOT NULL,
+    category_name TEXT NOT NULL,
+    price INTEGER NOT NULL,
+    emoji_icon TEXT DEFAULT '',
+    added_at INTEGER NOT NULL
+);
 """
 
 
@@ -146,6 +239,23 @@ async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(SCHEMA)
         # --- лёгкие миграции для существующих БД ---
+        async with db.execute("PRAGMA table_info(users)") as cur:
+            user_cols = {row[1] for row in await cur.fetchall()}
+        if "referral_rewarded" not in user_cols:
+            await db.execute("ALTER TABLE users ADD COLUMN referral_rewarded INTEGER DEFAULT 0")
+            await db.execute(
+                "UPDATE users SET referral_rewarded=1 WHERE referrer_id IS NOT NULL"
+            )
+        if "last_theft" not in user_cols:
+            await db.execute("ALTER TABLE users ADD COLUMN last_theft INTEGER DEFAULT 0")
+        if "last_subscription_check" not in user_cols:
+            await db.execute("ALTER TABLE users ADD COLUMN last_subscription_check INTEGER DEFAULT 0")
+        if "daily_actions" not in user_cols:
+            await db.execute("ALTER TABLE users ADD COLUMN daily_actions INTEGER DEFAULT 0")
+        async with db.execute("PRAGMA table_info(channel_join_log)") as cur:
+            channel_join_cols = {row[1] for row in await cur.fetchall()}
+        if "event_type" not in channel_join_cols:
+            await db.execute("ALTER TABLE channel_join_log ADD COLUMN event_type TEXT DEFAULT 'request'")
         async with db.execute("PRAGMA table_info(channels)") as cur:
             cols = {row[1] for row in await cur.fetchall()}
         if "invite_link" not in cols:
@@ -158,6 +268,14 @@ async def init_db():
             await db.execute("ALTER TABLE tasks ADD COLUMN task_type TEXT DEFAULT 'manual'")
         if "channel_id" not in task_cols:
             await db.execute("ALTER TABLE tasks ADD COLUMN channel_id INTEGER")
+        if "check_text" not in task_cols:
+            await db.execute("ALTER TABLE tasks ADD COLUMN check_text TEXT DEFAULT ''")
+        if "check_scope" not in task_cols:
+            await db.execute("ALTER TABLE tasks ADD COLUMN check_scope TEXT DEFAULT 'name'")
+        if "reset_period" not in task_cols:
+            await db.execute("ALTER TABLE tasks ADD COLUMN reset_period TEXT DEFAULT 'once'")
+        if "last_reset_date" not in task_cols:
+            await db.execute("ALTER TABLE tasks ADD COLUMN last_reset_date TEXT DEFAULT ''")
         async with db.execute("PRAGMA table_info(shop_items)") as cur:
             shop_cols = {row[1] for row in await cur.fetchall()}
         if "income_per_day" not in shop_cols:
@@ -169,6 +287,22 @@ async def init_db():
                 )
         if "emoji_icon" not in shop_cols:
             await db.execute("ALTER TABLE shop_items ADD COLUMN emoji_icon TEXT DEFAULT ''")
+        async with db.execute("PRAGMA table_info(token_shop_purchases)") as cur:
+            token_shop_purchase_cols = {row[1] for row in await cur.fetchall()}
+        if "anarchy_number" not in token_shop_purchase_cols:
+            await db.execute("ALTER TABLE token_shop_purchases ADD COLUMN anarchy_number TEXT DEFAULT ''")
+        if "minecraft_nick" not in token_shop_purchase_cols:
+            await db.execute("ALTER TABLE token_shop_purchases ADD COLUMN minecraft_nick TEXT DEFAULT ''")
+        if "status" not in token_shop_purchase_cols:
+            await db.execute("ALTER TABLE token_shop_purchases ADD COLUMN status TEXT DEFAULT 'inventory'")
+        if "processed_at" not in token_shop_purchase_cols:
+            await db.execute("ALTER TABLE token_shop_purchases ADD COLUMN processed_at INTEGER")
+        if "processed_by" not in token_shop_purchase_cols:
+            await db.execute("ALTER TABLE token_shop_purchases ADD COLUMN processed_by INTEGER")
+        await db.execute(
+            "UPDATE token_shop_purchases SET status='inventory' "
+            "WHERE COALESCE(status, '')=''"
+        )
         # seed settings
         for k, v in DEFAULTS.items():
             await db.execute(
@@ -191,6 +325,17 @@ async def init_db():
                 "INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",
                 ("funtime_test_ips_seeded", "1"),
             )
+        async with db.execute("SELECT COUNT(*) FROM token_shop_categories") as cur:
+            token_shop_categories_row = await cur.fetchone()
+        if not token_shop_categories_row or token_shop_categories_row[0] == 0:
+            now = int(time.time())
+            for name, menu_text, sort_order in TOKEN_SHOP_DEFAULT_CATEGORIES:
+                await db.execute(
+                    "INSERT INTO token_shop_categories"
+                    "(name, menu_text, emoji_icon, active, sort_order, created_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (name, menu_text, "", 1, sort_order, now),
+                )
         # seed owner as admin
         await db.execute(
             "INSERT OR IGNORE INTO admins(user_id, added_by, added_at) VALUES(?,?,?)",
@@ -237,6 +382,67 @@ async def fetchall(sql: str, params: tuple = ()) -> list:
             return list(await cur.fetchall())
 
 
+def normalize_reset_time(raw_value: str | None) -> str:
+    fallback = DEFAULTS.get("daily_task_reset_time", "00:00")
+    raw = (raw_value or fallback).strip()
+    try:
+        hours_raw, minutes_raw = raw.split(":", 1)
+        hours = int(hours_raw)
+        minutes = int(minutes_raw)
+        if not (0 <= hours <= 23 and 0 <= minutes <= 59):
+            raise ValueError
+    except (ValueError, AttributeError):
+        return fallback
+    return f"{hours:02d}:{minutes:02d}"
+
+
+def get_task_reset_marker(reset_time: str | None = None) -> str:
+    now = now_msk()
+    hours, minutes = map(int, normalize_reset_time(reset_time).split(":"))
+    boundary = now.replace(hour=hours, minute=minutes, second=0, microsecond=0)
+    if now < boundary:
+        boundary -= timedelta(days=1)
+    return boundary.date().isoformat()
+
+
+async def reset_due_daily_tasks(task_id: int | None = None) -> list[int]:
+    params: list[Any] = []
+    where_sql = ""
+    if task_id is not None:
+        where_sql = " AND id=?"
+        params.append(task_id)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT value FROM settings WHERE key='daily_task_reset_time'"
+        ) as cur:
+            reset_time_row = await cur.fetchone()
+        current_marker = get_task_reset_marker(reset_time_row[0] if reset_time_row else None)
+
+        async with db.execute(
+            "SELECT id FROM tasks "
+            "WHERE reset_period='daily' "
+            "AND COALESCE(last_reset_date, '')<>? "
+            f"{where_sql}",
+            (current_marker, *params),
+        ) as cur:
+            rows = await cur.fetchall()
+
+        reset_ids = [row[0] for row in rows]
+        if not reset_ids:
+            return []
+
+        for current_task_id in reset_ids:
+            await db.execute("DELETE FROM task_submissions WHERE task_id=?", (current_task_id,))
+            await db.execute("DELETE FROM task_completions WHERE task_id=?", (current_task_id,))
+            await db.execute(
+                "UPDATE tasks SET completions=0, active=1, last_reset_date=? WHERE id=?",
+                (current_marker, current_task_id),
+            )
+        await db.commit()
+        return reset_ids
+
+
 async def get_or_create_user(user_id: int, username: str | None, full_name: str, referrer_id: int | None = None):
     row = await fetchone("SELECT user_id FROM users WHERE user_id=?", (user_id,))
     if row:
@@ -245,26 +451,77 @@ async def get_or_create_user(user_id: int, username: str | None, full_name: str,
             (username or "", full_name or "", user_id),
         )
         return False
+    clean_referrer_id = None
+    if referrer_id and referrer_id != user_id:
+        ref_row = await fetchone(
+            "SELECT user_id FROM users WHERE user_id=? AND banned=0",
+            (referrer_id,),
+        )
+        if ref_row:
+            clean_referrer_id = referrer_id
     await execute(
         "INSERT INTO users(user_id, username, full_name, referrer_id, created_at) VALUES(?,?,?,?,?)",
-        (user_id, username or "", full_name or "", referrer_id, int(time.time())),
+        (user_id, username or "", full_name or "", clean_referrer_id, int(time.time())),
     )
-    if referrer_id and referrer_id != user_id:
-        ref_row = await fetchone("SELECT user_id FROM users WHERE user_id=?", (referrer_id,))
-        if ref_row:
-            try:
-                reward = int(await get_setting("ref_reward", "20"))
-            except Exception:
-                reward = 20
-            await execute(
-                "UPDATE users SET referrals=referrals+1, balance=balance+? WHERE user_id=?",
-                (reward, referrer_id),
-            )
-            await execute(
-                "INSERT INTO player_logs(user_id, action, created_at) VALUES(?,?,?)",
-                (user_id, f"Зарегистрировался по рефералу {referrer_id}", int(time.time())),
-            )
     return True
+
+
+async def reward_pending_referral(user_id: int) -> tuple[int, int] | None:
+    now = int(time.time())
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT referrer_id, referral_rewarded, banned FROM users WHERE user_id=?",
+            (user_id,),
+        ) as cur:
+            user_row = await cur.fetchone()
+        if not user_row:
+            return None
+
+        referrer_id, already_rewarded, user_banned = user_row
+        if user_banned or not referrer_id or referrer_id == user_id or already_rewarded:
+            return None
+
+        async with db.execute(
+            "SELECT value FROM settings WHERE key='maintenance_enabled'"
+        ) as cur:
+            maintenance_row = await cur.fetchone()
+        if maintenance_row and maintenance_row[0] == "1":
+            return None
+
+        async with db.execute(
+            "SELECT user_id FROM users WHERE user_id=? AND banned=0",
+            (referrer_id,),
+        ) as cur:
+            ref_row = await cur.fetchone()
+        if not ref_row:
+            return None
+
+        async with db.execute("SELECT value FROM settings WHERE key='ref_reward'") as cur:
+            reward_row = await cur.fetchone()
+        try:
+            reward = int(reward_row[0] if reward_row else DEFAULTS.get("ref_reward", "20"))
+        except (TypeError, ValueError):
+            reward = 20
+
+        cur = await db.execute(
+            "UPDATE users SET referral_rewarded=1 "
+            "WHERE user_id=? AND referral_rewarded=0",
+            (user_id,),
+        )
+        if cur.rowcount != 1:
+            await db.rollback()
+            return None
+
+        await db.execute(
+            "UPDATE users SET referrals=referrals+1, balance=balance+? WHERE user_id=?",
+            (reward, referrer_id),
+        )
+        await db.execute(
+            "INSERT INTO player_logs(user_id, action, created_at) VALUES(?,?,?)",
+            (user_id, f"Зарегистрировался по рефералу {referrer_id} после ОП", now),
+        )
+        await db.commit()
+        return referrer_id, reward
 
 
 async def is_admin(user_id: int) -> bool:
@@ -438,6 +695,9 @@ async def purge_user_data(user_id: int) -> dict[str, Any]:
         "task_completions_deleted": 0,
         "task_submissions_deleted": 0,
         "user_farms_deleted": 0,
+        "token_shop_inventory_deleted": 0,
+        "token_shop_requests_deleted": 0,
+        "token_shop_purchases_deleted": 0,
         "promo_uses_deleted": 0,
         "withdrawals_deleted": 0,
         "channel_join_logs_deleted": 0,
@@ -447,14 +707,14 @@ async def purge_user_data(user_id: int) -> dict[str, Any]:
     }
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT referrer_id FROM users WHERE user_id=?",
+            "SELECT referrer_id, referral_rewarded FROM users WHERE user_id=?",
             (user_id,),
         ) as cur:
             user_row = await cur.fetchone()
         if user_row:
             summary["had_user_row"] = True
-            referrer_id = user_row[0]
-            if referrer_id:
+            referrer_id, referral_rewarded = user_row
+            if referrer_id and referral_rewarded:
                 await db.execute(
                     "UPDATE users SET referrals=MAX(0, referrals-1) WHERE user_id=?",
                     (referrer_id,),
@@ -466,7 +726,10 @@ async def purge_user_data(user_id: int) -> dict[str, Any]:
             ) as cur:
                 row = await cur.fetchone()
                 summary["referrals_detached"] = row[0] if row else 0
-            await db.execute("UPDATE users SET referrer_id=NULL WHERE referrer_id=?", (user_id,))
+            await db.execute(
+                "UPDATE users SET referrer_id=NULL, referral_rewarded=0 WHERE referrer_id=?",
+                (user_id,),
+            )
 
         async with db.execute(
             "SELECT task_id, COUNT(*) FROM task_completions WHERE user_id=? GROUP BY task_id",
@@ -485,6 +748,12 @@ async def purge_user_data(user_id: int) -> dict[str, Any]:
 
         cur = await db.execute("DELETE FROM user_farms WHERE user_id=?", (user_id,))
         summary["user_farms_deleted"] = cur.rowcount
+        cur = await db.execute("DELETE FROM token_shop_requests WHERE user_id=?", (user_id,))
+        summary["token_shop_requests_deleted"] = cur.rowcount
+        cur = await db.execute("DELETE FROM token_shop_inventory WHERE user_id=?", (user_id,))
+        summary["token_shop_inventory_deleted"] = cur.rowcount
+        cur = await db.execute("DELETE FROM token_shop_purchases WHERE user_id=?", (user_id,))
+        summary["token_shop_purchases_deleted"] = cur.rowcount
         cur = await db.execute("DELETE FROM promo_uses WHERE user_id=?", (user_id,))
         summary["promo_uses_deleted"] = cur.rowcount
         cur = await db.execute("DELETE FROM withdrawals WHERE user_id=?", (user_id,))
@@ -503,3 +772,14 @@ async def purge_user_data(user_id: int) -> dict[str, Any]:
         summary["users_deleted"] = cur.rowcount
         await db.commit()
     return summary
+
+
+async def increment_user_daily_action(user_id: int) -> None:
+    await execute(
+        "UPDATE users SET daily_actions = daily_actions + 1 WHERE user_id=?",
+        (user_id,),
+    )
+
+
+async def reset_daily_user_actions() -> None:
+    await execute("UPDATE users SET daily_actions = 0")
