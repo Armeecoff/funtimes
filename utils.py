@@ -1,11 +1,18 @@
 import asyncio
 import html
 import re
+import time
 from aiogram import Bot
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    InputMediaPhoto,
+)
 from aiogram.exceptions import TelegramBadRequest
 
-from db import fetchall, fetchone, get_setting
+from db import execute, fetchall, fetchone, get_setting
 from keyboards import style_markup
 
 
@@ -16,11 +23,38 @@ def render_stored_icon_html(stored: str | None) -> str:
     if value.startswith("id:"):
         cid = value[3:].strip()
         if cid:
-            return f'<tg-emoji emoji-id="{html.escape(cid, quote=True)}"></tg-emoji>'
+            return f'<tg-emoji emoji-id="{html.escape(cid, quote=True)}">✨</tg-emoji>'
         return ""
     if value.startswith("tx:"):
         return html.escape(value[3:].strip())
     return html.escape(value)
+
+
+def extract_custom_emoji_id(value: str | None) -> str | None:
+    text = (value or "").strip()
+    if not text:
+        return None
+    if text.startswith("id:"):
+        cid = text[3:].strip()
+        return cid or None
+    if text.isdigit():
+        return text
+    match = re.search(r"emoji-id=[\"']([^\"']+)[\"']", text)
+    if match:
+        return match.group(1).strip() or None
+    return None
+
+
+def render_config_icon_html(value: str | None, fallback: str = "") -> str:
+    text = (value or "").strip()
+    if not text:
+        return fallback
+    cid = extract_custom_emoji_id(text)
+    if cid:
+        return f'<tg-emoji emoji-id="{html.escape(cid, quote=True)}">{html.escape(fallback or "✨")}</tg-emoji>'
+    if text.startswith("tx:"):
+        return html.escape(text[3:].strip())
+    return text
 
 
 def apply_stored_icon_to_button_text(text: str, stored: str | None) -> tuple[str, str | None]:
@@ -45,10 +79,10 @@ def build_subscription_gate_text(channels: list[tuple[str, str]], target_name: s
     if not channel_lines:
         channel_lines = "• Каналы скоро появятся"
     return (
-        "📌 <b>Доступ ограничен</b>\n\n"
-        f"<blockquote>Чтобы открыть {html.escape(target_name)}, подпишись на все обязательные каналы:\n\n"
+        "<tg-emoji emoji-id=5260268501515377807>📣</tg-emoji> <b>Доступ ограничен</b>\n\n"
+        f"<blockquote>Чтобы получать токены, подпишись на все каналы:\n\n"
         f"{channel_lines}</blockquote>\n\n"
-        "📷 После подписки нажми «Проверить доступ»."
+        "<tg-emoji emoji-id=5258077307985207053>📹</tg-emoji> После подписки нажми «Проверить доступ»."
     )
 
 
@@ -85,13 +119,35 @@ def format_shop_item_block(
     effective_price = max(0, price - price * max(0, discount_pct) // 100)
     lines = [
         f"{icon} <b>{html.escape(name)}</b>",
-        f"{icon} Цена: <b>{effective_price} {html.escape(currency_name)}</b>",
-        f"{icon} Доход: <b>{income_per_day} {html.escape(currency_name)}/день</b>",
-        f"{icon} Статус: <b>{'Доступно' if active else 'Недоступно'}</b>",
+        f"Цена: <b>{effective_price} {html.escape(currency_name)}</b>",
+        f"Доход: <b>{income_per_day} {html.escape(currency_name)}/день</b>",
+        f"Статус: <b>{'Доступно' if active else 'Недоступно'}</b>",
     ]
     clean_description = (description or "").strip()
     if clean_description and clean_description != "-":
         lines.append(html.escape(clean_description))
+    return "\n".join(lines)
+
+
+def format_token_shop_item_block(
+    *,
+    name: str,
+    price: int,
+    currency_name: str,
+    emoji_icon: str = "",
+    description: str = "",
+    active: bool | None = None,
+) -> str:
+    icon = render_stored_icon_html(emoji_icon) or "•"
+    lines = [
+        f"{icon} <b>{html.escape(name)}</b>",
+        f"Цена: <b>{price} {html.escape(currency_name)}</b>",
+    ]
+    clean_description = (description or "").strip()
+    if clean_description and clean_description != "-":
+        lines.append(html.escape(clean_description))
+    if active is not None:
+        lines.append(f"Статус: <b>{'Доступно' if active else 'Недоступно'}</b>")
     return "\n".join(lines)
 
 
@@ -105,18 +161,16 @@ async def send_section(target, text: str, photo_key: str | None, reply_markup: I
 
     if isinstance(target, CallbackQuery):
         msg = target.message
-        if photo:
+        if photo and msg.photo:
             try:
-                await msg.delete()
-            except Exception:
-                pass
-            try:
-                await msg.answer_photo(photo, caption=text, reply_markup=reply_markup)
+                await msg.edit_media(
+                    media=InputMediaPhoto(media=photo, caption=text, parse_mode="HTML"),
+                    reply_markup=reply_markup,
+                )
                 return
             except TelegramBadRequest:
-                await msg.answer(text, reply_markup=reply_markup)
-                return
-        # no photo — try edit
+                pass
+
         try:
             if msg.photo:
                 await msg.edit_caption(caption=text, reply_markup=reply_markup)
@@ -124,12 +178,18 @@ async def send_section(target, text: str, photo_key: str | None, reply_markup: I
                 await msg.edit_text(text, reply_markup=reply_markup)
             return
         except TelegramBadRequest:
-            try:
-                await msg.delete()
-            except Exception:
-                pass
-            await msg.answer(text, reply_markup=reply_markup)
-            return
+            pass
+
+        # Fallback: delete old message and send a plain text message
+        try:
+            await msg.delete()
+        except TelegramBadRequest:
+            pass
+        try:
+            await target.message.answer(text, reply_markup=reply_markup)
+        except TelegramBadRequest:
+            pass
+        return
 
     # Message
     if photo:
@@ -200,14 +260,26 @@ async def has_pending_channel_request(user_id: int, chat_id: str | int) -> bool:
     return pending is not None
 
 
-async def is_user_subscribed_to_chat(bot: Bot, user_id: int, chat_id: str | int) -> bool:
+async def is_user_subscribed_to_chat(
+    bot: Bot,
+    user_id: int,
+    chat_id: str | int,
+    *,
+    suppress_errors: bool = True,
+) -> bool:
     try:
         member = await bot.get_chat_member(chat_id, user_id)
-        if member.status not in ("left", "kicked"):
-            return True
     except Exception:
-        pass
-    return await has_pending_channel_request(user_id, chat_id)
+        if suppress_errors:
+            return False
+        raise
+
+    status = getattr(member.status, "value", member.status)
+    if status in {"creator", "administrator", "member"}:
+        return True
+    if status == "restricted":
+        return bool(getattr(member, "is_member", False))
+    return False
 
 
 async def get_channel_members_count(bot: Bot, chat_id: str | int) -> int | None:
@@ -235,6 +307,69 @@ async def check_user_subscriptions(bot: Bot, user_id: int, category: str) -> lis
         except Exception:
             not_subbed.append((display_link, title))
     return not_subbed
+
+
+async def refresh_user_start_subscription(bot: Bot, user_id: int) -> int | None:
+    now = int(time.time())
+    row = await fetchone(
+        "SELECT captcha_passed, banned FROM users WHERE user_id=?",
+        (user_id,),
+    )
+    if not row:
+        return None
+
+    current_captcha_passed, banned = row
+    if banned:
+        await execute(
+            "UPDATE users SET last_subscription_check=? WHERE user_id=?",
+            (now, user_id),
+        )
+        return 0
+
+    if (await get_setting("start_op_enabled", "0")) != "1":
+        await execute(
+            "UPDATE users SET last_subscription_check=? WHERE user_id=?",
+            (now, user_id),
+        )
+        return current_captcha_passed
+
+    captcha_enabled = (await get_setting("captcha_enabled", "0")) == "1"
+    channels = await get_active_channels("start")
+    is_subscribed_everywhere = True
+
+    for channel in channels:
+        chat_id = channel[2]
+        if not chat_id:
+            continue
+        try:
+            subscribed = await is_user_subscribed_to_chat(
+                bot,
+                user_id,
+                chat_id,
+                suppress_errors=False,
+            )
+        except Exception:
+            await execute(
+                "UPDATE users SET last_subscription_check=? WHERE user_id=?",
+                (now, user_id),
+            )
+            return current_captcha_passed
+        if not subscribed:
+            is_subscribed_everywhere = False
+            break
+
+    if not is_subscribed_everywhere:
+        new_captcha_passed = 0
+    elif captcha_enabled:
+        new_captcha_passed = current_captcha_passed
+    else:
+        new_captcha_passed = 1
+
+    await execute(
+        "UPDATE users SET captcha_passed=?, last_subscription_check=? WHERE user_id=?",
+        (new_captcha_passed, now, user_id),
+    )
+    return new_captcha_passed
 
 
 async def query_minecraft_status(host_port: str) -> int | None:
