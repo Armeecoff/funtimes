@@ -14,6 +14,11 @@ class PromoSG(StatesGroup):
     code = State()
 
 
+class TokenShopPurchaseSG(StatesGroup):
+    anarchy = State()
+    nick = State()
+
+
 class ManualTaskSG(StatesGroup):
     waiting_text = State()
 
@@ -45,6 +50,8 @@ class AdminTask(StatesGroup):
     name = State()
     reward = State()
     max_completions = State()
+    edit_reward = State()
+    edit_max_completions = State()
 
 
 class AdminShop(StatesGroup):
@@ -53,6 +60,20 @@ class AdminShop(StatesGroup):
     price = State()
     income = State()
     active = State()
+
+
+class AdminTokenShop(StatesGroup):
+    category_emoji = State()
+    category_name = State()
+    category_text = State()
+    category_active = State()
+    category_edit_text = State()
+    category_edit_emoji = State()
+    item_emoji = State()
+    item_name = State()
+    item_description = State()
+    item_price = State()
+    item_active = State()
 
 
 class AdminFuntime(StatesGroup):
@@ -83,3 +104,20 @@ class AdminRulesEdit(StatesGroup):
 class AdminBtnStyle(StatesGroup):
     pick_style = State()
     pick_icon = State()
+
+
+class AdminAutoBroadcast(StatesGroup):
+    text = State()
+    time = State()
+
+
+class AdminTaskReset(StatesGroup):
+    time = State()
+
+
+class AdminDailyThreshold(StatesGroup):
+    value = State()
+
+
+class AdminDailyResetTime(StatesGroup):
+    value = State()
