@@ -1,15 +1,19 @@
 import random
 import time
 import logging
+import html
 from aiogram import Router, F, Bot
 from aiogram.filters import CommandStart, CommandObject
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    ChatJoinRequest,
+    ChatJoinRequest, ChatMemberUpdated,
 )
 from aiogram.fsm.context import FSMContext
 
-from db import get_or_create_user, get_setting, set_setting, fetchone, execute, is_admin
+from db import (
+    get_or_create_user, get_setting, set_setting, fetchone, execute, is_admin,
+    reward_pending_referral,
+)
 from states import CaptchaSG
 from keyboards import main_menu_kb, remove_reply
 from utils import (
@@ -20,6 +24,18 @@ from utils import (
 )
 
 router = Router()
+
+
+async def normalize_referrer_id(referrer_id: int | None, user_id: int) -> int | None:
+    if not referrer_id or referrer_id == user_id:
+        return None
+    row = await fetchone(
+        "SELECT banned FROM users WHERE user_id=?",
+        (referrer_id,),
+    )
+    if not row or row[0]:
+        return None
+    return referrer_id
 
 
 def captcha_kb(options: list[int], correct: int) -> InlineKeyboardMarkup:
@@ -37,6 +53,24 @@ async def show_main_menu(target, state: FSMContext):
                        reply_markup=await main_menu_kb(is_admin=admin_flag))
 
 
+async def notify_referral_reward(user_id: int, bot: Bot):
+    result = await reward_pending_referral(user_id)
+    if not result:
+        return
+
+    referrer_id, reward = result
+    currency_name = await get_setting("currency_name", "токенов")
+    premium_emoji = '<tg-emoji emoji-id="5258368777350816286">🪙</tg-emoji>'
+    text = (
+        f"{premium_emoji}<b>По вашей ссылке зарегистрировался новый пользователь и прошёл ОП!</b>\n"
+        f"<b>Вы получили {reward} {html.escape(currency_name or 'токенов')}</b>{premium_emoji}"
+    )
+    try:
+        await bot.send_message(referrer_id, text)
+    except Exception:
+        pass
+
+
 async def gate_and_show_menu(message_or_call, user_id: int, state: FSMContext, bot: Bot):
     """Run start-OP + captcha gate, then show menu. Works for Message or CallbackQuery."""
     if (await get_setting("start_op_enabled", "0")) == "1":
@@ -46,6 +80,8 @@ async def gate_and_show_menu(message_or_call, user_id: int, state: FSMContext, b
             kb = build_subscription_gate_kb(not_subbed, "start")
             await send_section(message_or_call, text, "op_photo", reply_markup=kb)
             return False
+
+    await notify_referral_reward(user_id, bot)
 
     row = await fetchone("SELECT captcha_passed FROM users WHERE user_id=?", (user_id,))
     if (await get_setting("captcha_enabled", "0")) == "1" and not (row and row[0]):
@@ -80,6 +116,7 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext,
             referrer_id = int(command.args)
         except ValueError:
             pass
+    referrer_id = await normalize_referrer_id(referrer_id, message.from_user.id)
     # Считаем переходы по ссылке бота: каждый /start — это клик.
     try:
         total = int(await get_setting("bot_link_clicks", "0") or "0")
@@ -99,7 +136,6 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext,
     )
     row = await fetchone("SELECT banned FROM users WHERE user_id=?", (message.from_user.id,))
     if row and row[0]:
-        await message.answer("⛔ Вы заблокированы в этом боте.")
         return
     # remove any old reply keyboard if present
     try:
@@ -159,16 +195,7 @@ async def cb_cancel(call: CallbackQuery, state: FSMContext):
 
 # ---------- Заявки на вступление в каналы ОП ----------
 
-@router.chat_join_request()
-async def on_chat_join_request(req: ChatJoinRequest, bot: Bot):
-    """Срабатывает, когда пользователь подал заявку через invite-link с
-    creates_join_request=True. Сопоставляем ссылку с каналом из БД и считаем."""
-    used_link = ""
-    if req.invite_link is not None:
-        used_link = req.invite_link.invite_link or ""
-    chat_id_str = str(req.chat.id)
-
-    # Ищем канал: сначала по точному совпадению invite_link, иначе по chat_id
+async def find_tracked_channel(chat_id_str: str, used_link: str = "") -> int | None:
     row = None
     if used_link:
         row = await fetchone(
@@ -178,33 +205,95 @@ async def on_chat_join_request(req: ChatJoinRequest, bot: Bot):
         row = await fetchone(
             "SELECT id FROM channels WHERE chat_id=?", (chat_id_str,)
         )
-    if row is None:
+    return row[0] if row else None
+
+
+async def track_channel_link_event(
+    channel_id: int,
+    user_id: int,
+    used_link: str,
+    event_type: str,
+) -> bool:
+    dup = await fetchone(
+        "SELECT 1 FROM channel_join_log WHERE channel_id=? AND user_id=?",
+        (channel_id, user_id),
+    )
+    if dup:
+        return False
+
+    request_delta = 1 if event_type == "request" else 0
+    await execute(
+        "INSERT INTO channel_join_log(channel_id, user_id, invite_link, event_type, created_at) "
+        "VALUES(?,?,?,?,?)",
+        (channel_id, user_id, used_link, event_type, int(time.time())),
+    )
+    await execute(
+        "INSERT INTO channel_stats(channel_id, join_requests, members, reach) "
+        "VALUES(?, ?, 0, 1) "
+        "ON CONFLICT(channel_id) DO UPDATE SET "
+        "join_requests = join_requests + ?, reach = reach + 1",
+        (channel_id, request_delta, request_delta),
+    )
+    return True
+
+
+def is_joined_member(chat_member) -> bool:
+    status = getattr(getattr(chat_member, "status", ""), "value", getattr(chat_member, "status", ""))
+    if status in {"creator", "administrator", "member"}:
+        return True
+    if status == "restricted":
+        return bool(getattr(chat_member, "is_member", False))
+    return False
+
+
+@router.chat_join_request()
+async def on_chat_join_request(req: ChatJoinRequest, bot: Bot):
+    """Срабатывает, когда пользователь подал заявку через invite-link с
+    creates_join_request=True. Сопоставляем ссылку с каналом из БД и считаем."""
+    used_link = ""
+    if req.invite_link is not None:
+        used_link = req.invite_link.invite_link or ""
+    chat_id_str = str(req.chat.id)
+
+    channel_id = await find_tracked_channel(chat_id_str, used_link)
+    if channel_id is None:
         logging.info(
             "chat_join_request: канал %s не найден в БД (link=%s)",
             chat_id_str, used_link,
         )
         return
-    channel_id = row[0]
 
-    # Считаем заявку (без дублей по user_id)
-    dup = await fetchone(
-        "SELECT 1 FROM channel_join_log WHERE channel_id=? AND user_id=?",
-        (channel_id, req.from_user.id),
-    )
-    if dup:
+    if not await track_channel_link_event(channel_id, req.from_user.id, used_link, "request"):
         return
-    await execute(
-        "INSERT INTO channel_join_log(channel_id, user_id, invite_link, created_at) "
-        "VALUES(?,?,?,?)",
-        (channel_id, req.from_user.id, used_link, int(time.time())),
-    )
-    await execute(
-        "INSERT INTO channel_stats(channel_id, join_requests, members, reach) "
-        "VALUES(?, 1, 0, 0) "
-        "ON CONFLICT(channel_id) DO UPDATE SET join_requests = join_requests + 1",
-        (channel_id,),
-    )
     logging.info(
         "chat_join_request: +1 заявка в канал #%s от user %s",
         channel_id, req.from_user.id,
+    )
+
+
+@router.chat_member()
+async def on_chat_member_update(event: ChatMemberUpdated):
+    if is_joined_member(event.old_chat_member) or not is_joined_member(event.new_chat_member):
+        return
+
+    used_link = ""
+    if event.invite_link is not None:
+        used_link = event.invite_link.invite_link or ""
+    chat_id_str = str(event.chat.id)
+    channel_id = await find_tracked_channel(chat_id_str, used_link)
+    if channel_id is None:
+        logging.info(
+            "chat_member: канал %s не найден в БД (link=%s)",
+            chat_id_str, used_link,
+        )
+        return
+
+    user = event.new_chat_member.user
+    if not user or user.is_bot:
+        return
+    if not await track_channel_link_event(channel_id, user.id, used_link, "member"):
+        return
+    logging.info(
+        "chat_member: +1 прямое вступление в канал #%s от user %s",
+        channel_id, user.id,
     )
